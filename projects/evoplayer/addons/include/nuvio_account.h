@@ -13,11 +13,19 @@
  *
  * Configured by FTP, in /data/evoplayer/providers/nuvio-native/account.conf:
  *
- *   server=https://nuvio.example.com
- *   email=me@example.com
- *   password=...        read once, exchanged for a refresh token, and then
- *                       removed from the file - it is never written back
+ *   server=https://nuvio.example.com   (or backend_url= + publishable_key=)
  *   profile=1           optional, NuvioTV profile id (1 = primary)
+ *   link_page=...       optional, the page the device code is entered on;
+ *                       default nuvio.tv/link, or <backend>/link with server=
+ *
+ * Signing in, either:
+ *
+ *   - device login (NuvioTV's QR flow, shown as text): the Nuvio screen shows
+ *     a short code, the user enters it on nuvio.tv/link on a phone, and the
+ *     console exchanges it for a session. Needs nothing else in the file.
+ *     This is how the official server signs TVs in.
+ *   - email= + password=: read once, exchanged for a refresh token, then
+ *     removed from the file. For servers that allow password sign-in.
  *
  * Every call is asynchronous, completes on the main thread through
  * evo_net_poll(), and fires its callback exactly once. A request that comes
@@ -61,6 +69,34 @@ int  nuvio_account_select(const char *path_and_query, nuvio_account_cb cb, void 
 
 /* The origin client id NuvioTV sends as p_origin_client_id. */
 const char *nuvio_account_client_id(void);
+
+/* ---- Device login ---------------------------------------------------------
+ *
+ * One step per call: start a code, poll it, or exchange an approved one. The
+ * callback fires once the step is done (ok = 1 even when the step's answer is
+ * "not yet" or "expired" - read the state); ok = 0 is not used. Returns
+ * negative if the step could not be started, and the callback will not fire.
+ */
+enum {
+    NUVIO_LINK_IDLE = 0,
+    NUVIO_LINK_STARTING,
+    NUVIO_LINK_PENDING,     /* code on screen, waiting for approval */
+    NUVIO_LINK_EXPIRED,     /* expired / used / cancelled - next step starts over */
+    NUVIO_LINK_FAILED,      /* see nuvio_account_link_message() */
+    NUVIO_LINK_DONE
+};
+
+/* 1 when a server is set and there is no session yet. */
+int  nuvio_account_can_link(void);
+int  nuvio_account_link_step(nuvio_account_cb cb, void *ud);
+int  nuvio_account_link_state(void);
+const char *nuvio_account_link_code(void);      /* "ABCD-1234"            */
+const char *nuvio_account_link_page(void);      /* "https://nuvio.tv/link" */
+const char *nuvio_account_link_message(void);
+int  nuvio_account_link_minutes_left(void);     /* -1 unknown             */
+
+/* ISO 8601 as the server writes it -> unix ms (0 if unparseable). */
+int64_t nuvio_account_parse_iso_ms(const char *iso);
 
 #ifdef __cplusplus
 }

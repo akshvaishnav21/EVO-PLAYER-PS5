@@ -27,6 +27,7 @@
 #include "nuvio_progress.h"
 #include "nuvio_json.h"
 #include "nuvio_debrid.h"
+#include "nuvio_account.h"
 
 #include <sys/stat.h>
 
@@ -762,7 +763,7 @@ typedef struct {
     const char *path;        /* matched without the query unless it has one */
     int         status;
     const char *body;
-    const char *body2;       /* served from the second call on, if set */
+    const char *body2;       /* served from the second call on, with 200 */
     int         calls;
 } fake_route_t;
 
@@ -820,7 +821,8 @@ static void *fake_conn(void *arg)
         if (strlen(r->path) != pl || strncmp(r->path, path, pl) != 0) continue;
         hit = r;
         body = (r->calls > 0 && r->body2) ? r->body2 : r->body;
-        status = r->status;
+        /* The follow-up body is the success case, so it is served 200. */
+        status = (r->calls > 0 && r->body2) ? 200 : r->status;
         r->calls++;
         break;
     }
@@ -1205,6 +1207,122 @@ static void test_nuvio_e2e_account(void)
                 strstr(push, "\"p_profile_id\":2") && strstr(push, "\"p_origin_client_id\":\"evo-ps5-"),
                 "dirty entry pushed in NuvioTV's shape");
     TEST_ASSERT(!strstr(push, "tt2_s1e1"), "pulled entry not pushed back");
+    TEST_PASS();
+}
+
+/* Is there a logged request whose request line has `needle` and whose text
+ * does not contain `absent`? */
+static int fake_any_without(const char *needle, const char *absent)
+{
+    int hit = 0;
+    pthread_mutex_lock(&g_fake_mx);
+    for (int i = 0; i < g_fake_log_n && !hit; ++i) {
+        const char *eol = strstr(g_fake_log[i], "\r\n");
+        size_t n = eol ? (size_t)(eol - g_fake_log[i]) : strlen(g_fake_log[i]);
+        char line[2100];
+        snprintf(line, sizeof line, "%.*s", (int)(n < 2099 ? n : 2099), g_fake_log[i]);
+        if (strstr(line, needle) && !strstr(g_fake_log[i], absent)) hit = 1;
+    }
+    pthread_mutex_unlock(&g_fake_mx);
+    return hit;
+}
+
+static char B_DL_CONF[256], B_LG_CONF[256];
+
+static void test_nuvio_e2e_device_login(void)
+{
+    TEST_START("nuvio e2e: device login (code on screen)");
+    const evo_provider_t *nv = evo_provider_find("nuvio-native");
+
+    TEST_ASSERT(nuvio_account_parse_iso_ms("1970-01-02T00:00:00Z") == 86400000LL, "iso Z");
+    TEST_ASSERT(nuvio_account_parse_iso_ms("1970-01-02T01:00:00.5+01:00") == 86400000LL, "iso offset + fraction");
+    TEST_ASSERT(nuvio_account_parse_iso_ms("junk") == 0, "iso junk");
+
+    fake_route("POST", "/dl/rest/v1/rpc/start_device_login_session", 200,
+        "[{\"device_code\":\"DC1\",\"user_code\":\"ABCD-1234\",\"verification_uri\":\"https://nuvio.tv/link\","
+        "\"verification_uri_complete\":\"https://nuvio.tv/link?code=ABCD-1234\","
+        "\"expires_at\":\"2099-01-01T00:00:00+00:00\",\"poll_interval_seconds\":3}]", NULL);
+    fake_route("POST", "/dl/rest/v1/rpc/poll_tv_login_session", 200,
+        "[{\"status\":\"pending\",\"expires_at\":\"2099-01-01T00:00:00+00:00\"}]",
+        "[{\"status\":\"approved\"}]");
+    fake_route("POST", "/dl/functions/v1/tv-logins-exchange", 200,
+        "{\"access_token\":\"AT9\",\"refresh_token\":\"RT9\",\"expires_in\":3600,\"user\":{\"id\":\"u9\"}}", NULL);
+    fake_route("POST", "/dl/rest/v1/rpc/get_sync_owner", 200, "\"u9\"", NULL);
+    fake_route("GET",  "/dl/rest/v1/addons", 200, "[]", NULL);
+    fake_route("POST", "/dl/rest/v1/rpc/sync_pull_watch_progress", 200, "[]", NULL);
+    fake_route("POST", "/dl/rest/v1/rpc/sync_push_watch_progress", 204, "", NULL);
+
+    snprintf(B_DL_CONF, sizeof B_DL_CONF,
+             "backend_url=http://127.0.0.1:%d/dl\npublishable_key=PK2\n", g_fake_port);
+    write_text("providers/nuvio-native/account.conf", B_DL_CONF);
+    TEST_ASSERT(nv->init() == 0, "re-init");
+
+    TEST_ASSERT(list(nv, "", 0) >= 1 && !strcmp(g_it[0].id, "login") &&
+                strstr(g_it[0].title, "Link your Nuvio account"), "login row first at the root");
+    TEST_ASSERT(!fake_find("/dl/rest/v1/rpc/get_sync_owner"), "no sync without a session");
+
+    /* Step 1: a code. */
+    TEST_ASSERT(list(nv, "login", 0) == 2, "code rows");
+    TEST_ASSERT(strstr(g_it[0].title, "nuvio.tv/link") && !strstr(g_it[0].title, "https://"), g_it[0].title);
+    TEST_ASSERT(strstr(g_it[0].subtitle, "ABCD-1234"), g_it[0].subtitle);
+    TEST_ASSERT(!strcmp(g_it[0].id, "login") && !strcmp(g_it[1].id, "login") && g_it[0].is_folder,
+                "every row re-opens the level (X = check again)");
+    TEST_ASSERT(strstr(g_it[1].subtitle, "Waiting") && strstr(g_it[1].subtitle, "expires in"), g_it[1].subtitle);
+    const char *start = fake_find("start_device_login_session");
+    TEST_ASSERT(start && strstr(start, "apikey: PK2") &&
+                strstr(start, "\"p_redirect_base_url\":\"https://nuvio.tv/link\"") &&
+                strstr(start, "\"p_device_type\":\"tv\"") && strstr(start, "\"p_device_name\":\"PlayStation 5\""),
+                "start request in NuvioTV's shape");
+    const char *nk = strstr(start, "\"p_device_nonce\":\"");
+    TEST_ASSERT(nk, "nonce sent");
+    char nonce[64];
+    snprintf(nonce, sizeof nonce, "%.32s", nk + 18);
+    TEST_ASSERT(strlen(nonce) == 32 && !strchr(nonce, '"'), "24-byte base64url nonce");
+
+    /* Step 2: not yet. */
+    TEST_ASSERT(list(nv, "login", 0) == 2 && strstr(g_it[1].subtitle, "Not approved yet"), g_it[1].subtitle);
+    const char *poll = fake_find("poll_tv_login_session");
+    TEST_ASSERT(poll && strstr(poll, "\"p_code\":\"DC1\"") && strstr(poll, nonce), "poll with device code + nonce");
+
+    /* Step 3: approved -> exchanged -> signed in. */
+    TEST_ASSERT(list(nv, "login", 0) == 1 && strstr(g_it[0].title, "Signed in"), g_it[0].title);
+    const char *ex = fake_find("tv-logins-exchange");
+    TEST_ASSERT(ex && strstr(ex, "\"code\":\"DC1\"") && strstr(ex, nonce), "exchange with the same nonce");
+    TEST_ASSERT(file_contains("providers/nuvio-native/account.conf", "refresh_token=RT9"), "session saved");
+
+    /* Back at the root: no login row, and the account syncs. */
+    TEST_ASSERT(list(nv, "", 0) >= 1 && strcmp(g_it[0].id, "login") != 0, "login row gone");
+    const char *own = fake_find("/dl/rest/v1/rpc/get_sync_owner");
+    TEST_ASSERT(own && strstr(own, "Authorization: Bearer AT9"), "synced with the device-login session");
+    TEST_PASS();
+}
+
+static void test_nuvio_e2e_device_login_legacy(void)
+{
+    TEST_START("nuvio e2e: device login, legacy server fallback");
+    const evo_provider_t *nv = evo_provider_find("nuvio-native");
+
+    fake_route("POST", "/lg/rest/v1/rpc/start_device_login_session", 404,
+        "{\"code\":\"PGRST202\",\"message\":\"Could not find the function "
+        "public.start_device_login_session(p_device_name, p_device_nonce) in the schema cache\"}", NULL);
+    fake_route("POST", "/lg/rest/v1/rpc/start_tv_login_session", 404,
+        "{\"code\":\"PGRST202\",\"message\":\"Could not find the function "
+        "public.start_tv_login_session(p_device_name, p_device_nonce, p_redirect_base_url)\"}",
+        "[{\"code\":\"LEG1\",\"web_url\":\"https://nuvio.tv/tv-login?code=LEG1\","
+        "\"expires_at\":\"2099-01-01T00:00:00Z\",\"poll_interval_seconds\":3}]");
+    fake_route("POST", "/lg/rest/v1/rpc/poll_tv_login_session", 200, "[{\"status\":\"expired\"}]", NULL);
+
+    snprintf(B_LG_CONF, sizeof B_LG_CONF,
+             "backend_url=http://127.0.0.1:%d/lg\npublishable_key=PK3\n", g_fake_port);
+    write_text("providers/nuvio-native/account.conf", B_LG_CONF);
+    TEST_ASSERT(nv->init() == 0, "re-init");
+
+    TEST_ASSERT(list(nv, "login", 0) == 2, "code rows via the legacy RPC");
+    TEST_ASSERT(strstr(g_it[0].title, "nuvio.tv/tv-login") && strstr(g_it[0].subtitle, "LEG1"), g_it[0].title);
+    TEST_ASSERT(fake_any_without("/lg/rest/v1/rpc/start_tv_login_session", "p_device_name"),
+                "retried without p_device_name");
+    TEST_ASSERT(list(nv, "login", 0) == 1 && strstr(g_it[0].title, "expired") &&
+                strstr(g_it[0].subtitle, "new code"), g_it[0].title);
 
     fake_stop();
     TEST_PASS();
@@ -1293,6 +1411,8 @@ int main(void)
     test_nuvio_e2e_realdebrid();
     test_nuvio_e2e_series_progress();
     test_nuvio_e2e_account();
+    test_nuvio_e2e_device_login();
+    test_nuvio_e2e_device_login_legacy();
 
     printf("\n----------------------------------------------------------------------\n");
     printf("  Results: %d/%d passed (%d failed)\n",

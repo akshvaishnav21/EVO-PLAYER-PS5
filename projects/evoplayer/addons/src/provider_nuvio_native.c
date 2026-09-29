@@ -12,6 +12,7 @@
  * folders. Every id below is opaque to EVO and parsed only here:
  *
  *   ""                              root: Continue Watching + one per catalog
+ *   "login"                         device login: the code to enter on a phone
  *   "cw"                            Continue Watching
  *   "c:<addon>:<type>:<catalog>"    a catalog, paged by skip
  *   "m:<type>:<meta>"               a title: seasons, or straight to streams
@@ -595,11 +596,26 @@ static const evo_provider_item_t *recent_find(const char *id)
 
 static void emit_root(evo_provider_items_cb cb, void *ud)
 {
-    int cap = 1;
+    int cap = 2;
     for (int i = 0; i < G.count; ++i) if (G.loaded[i]) cap += G.addons[i].catalog_count;
     evo_provider_item_t *it = (evo_provider_item_t *)calloc((size_t)cap, sizeof *it);
     if (!it) { cb(0, NULL, 0, 0, ud); return; }
     int n = 0;
+
+    /* Not signed in, but a server is set: offer the device login first. */
+    if (nuvio_account_can_link() && n < cap) {
+        evo_provider_item_t *r = &it[n];
+        evo_provider_item_clear(r);
+        snprintf(r->id, sizeof r->id, "login");
+        snprintf(r->title, sizeof r->title, "Link your Nuvio account");
+        if (nuvio_account_link_state() == NUVIO_LINK_PENDING)
+            snprintf(r->subtitle, sizeof r->subtitle, "Code %s  -  press X to finish",
+                     nuvio_account_link_code());
+        else
+            snprintf(r->subtitle, sizeof r->subtitle, "Sign in with a code on your phone");
+        r->is_folder = 1;
+        ++n;
+    }
 
     int cw[NUVIO_PROGRESS_MAX];
     int ncw = nuvio_progress_continue(&G.progress, cw, NUVIO_PROGRESS_MAX);
@@ -1213,6 +1229,105 @@ static int nv_search(const char *query, int page, evo_provider_items_cb cb, void
 }
 
 /* ------------------------------------------------------------------------- */
+/* Device login                                                              */
+/* ------------------------------------------------------------------------- */
+/*
+ * The "login" level. Every row on it is itself "login", so X on any of them
+ * re-opens the level - which the host treats as a refresh, not a push - and
+ * that is one step of the flow: a fresh code the first time, a poll after,
+ * the exchange once approved. The provider has no timer; the user's X after
+ * approving on the phone is the poll.
+ */
+
+static void login_row(evo_provider_item_t *r, const char *title, const char *sub,
+                      const char *overview)
+{
+    evo_provider_item_clear(r);
+    snprintf(r->id, sizeof r->id, "login");
+    snprintf(r->title, sizeof r->title, "%s", title);
+    snprintf(r->subtitle, sizeof r->subtitle, "%s", sub);
+    snprintf(r->overview, sizeof r->overview, "%s", overview);
+    r->is_folder = 1;
+}
+
+static void emit_login(evo_provider_items_cb cb, void *ud)
+{
+    evo_provider_item_t it[2];
+    int n = 0;
+    char a[256], b[256];
+
+    switch (nuvio_account_link_state()) {
+    case NUVIO_LINK_DONE:
+        /* The root syncs the account the next time it is listed. */
+        G.account_synced = 0;
+        login_row(&it[n++], "Signed in to Nuvio",
+                  "Press O to go back - your addons and progress sync now", "");
+        break;
+
+    case NUVIO_LINK_PENDING: {
+        const char *page = nuvio_account_link_page();
+        if (!strncmp(page, "https://", 8)) page += 8;
+        else if (!strncmp(page, "http://", 7)) page += 7;
+        snprintf(a, sizeof a, "On your phone, go to  %s", page);
+        snprintf(b, sizeof b, "Enter the code  %s", nuvio_account_link_code());
+        login_row(&it[n++], a, b,
+                  "Sign in to Nuvio on that page, enter the code and approve this "
+                  "PlayStation. Then press X here.");
+        int left = nuvio_account_link_minutes_left();
+        if (left > 0)
+            snprintf(b, sizeof b, "%s  -  code expires in %d min",
+                     nuvio_account_link_message(), left);
+        else
+            snprintf(b, sizeof b, "%s", nuvio_account_link_message());
+        snprintf(a, sizeof a, "Code  %s", nuvio_account_link_code());
+        login_row(&it[n++], a, b, "Press X to check whether you have approved it.");
+        break;
+    }
+
+    case NUVIO_LINK_EXPIRED:
+        login_row(&it[n++], nuvio_account_link_message(), "Press X for a new code", "");
+        break;
+
+    case NUVIO_LINK_FAILED:
+        login_row(&it[n++], "Could not sign in", nuvio_account_link_message(),
+                  "Check server= (or backend_url= and publishable_key=) in account.conf, "
+                  "and the nuvio account lines in evo.log. Press X to try again.");
+        break;
+
+    default:
+        login_row(&it[n++], "Getting a code...", "Press X if nothing appears", "");
+        break;
+    }
+    cb(1, it, n, 0, ud);
+}
+
+typedef struct link_req {
+    evo_provider_items_cb cb;
+    void *ud;
+} link_req_t;
+
+static void on_link_step(int ok, const char *body, size_t len, void *ud)
+{
+    (void)ok; (void)body; (void)len;
+    link_req_t *q = (link_req_t *)ud;
+    emit_login(q->cb, q->ud);
+    free(q);
+}
+
+static int open_login(evo_provider_items_cb cb, void *ud)
+{
+    link_req_t *q = (link_req_t *)calloc(1, sizeof *q);
+    if (!q) return -2;
+    q->cb = cb;
+    q->ud = ud;
+    int rc = nuvio_account_link_step(on_link_step, q);
+    if (rc == 0) return 0;
+    free(q);
+    if (rc == -2) { emit_login(cb, ud); return 0; }   /* a step is in flight */
+    return -1;
+}
+
+/* ------------------------------------------------------------------------- */
 /* The vtable                                                                */
 /* ------------------------------------------------------------------------- */
 
@@ -1236,6 +1351,7 @@ static int nv_list_catalog(const char *parent_id, int page, evo_provider_items_c
     }
 
     if (!strcmp(id, "cw")) { emit_continue(cb, ud); return 0; }
+    if (!strcmp(id, "login")) return page > 0 ? (cb(1, NULL, 0, 0, ud), 0) : open_login(cb, ud);
     if (page > 0 && id[0] != 'c') { cb(1, NULL, 0, 0, ud); return 0; }
 
     if (!strncmp(id, "c:", 2)) return open_catalog(id, page, cb, ud);

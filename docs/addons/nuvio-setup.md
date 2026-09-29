@@ -68,20 +68,30 @@ Torbox or Real-Debrid and press X, then type the API key. It is saved to
 cached torrents play.
 
 **Nuvio account** (`account.conf`, optional): pulls your addon list and
-syncs watch progress with the account.
+syncs watch progress with the account. The file only says **which server**:
 
 ```
-server=https://your-nuvio-server.example
-email=you@example.com
-password=...
+backend_url=https://xxxx.supabase.co
+publishable_key=...
 profile=1
 ```
 
-`server` must be a Nuvio server that publishes `/.well-known/nuvio` (a
-self-hosted one). For any other Supabase backend, use `backend_url=` and
-`publishable_key=` instead of `server=`. The password is replaced by a
-refresh token after the first sign-in. If sign-in fails, `evo.log` has a
-`nuvio account:` line saying why.
+For a self-hosted Nuvio server that publishes `/.well-known/nuvio`, a single
+`server=https://your-nuvio-server.example` line replaces the first two.
+
+Then sign in with a code, the way NuvioTV's TV app does:
+
+1. Open Nuvio on the PS5. The first row is **Link your Nuvio account**. Press X.
+2. It shows a page (`nuvio.tv/link` for the official server) and a code.
+3. On your phone, open that page, sign in to Nuvio, enter the code and approve.
+4. Back on the PS5, press X. It shows **Signed in to Nuvio**. Press O and
+   your addons and watch progress sync.
+
+The session is saved as a refresh token in `account.conf`, so this is a
+one-time step. An expired code is replaced by pressing X again. A server that
+allows password sign-in also accepts `email=` and `password=` lines instead;
+the password is removed from the file after the first sign-in. If anything
+fails, `evo.log` has a `nuvio account:` line saying why.
 
 **Skin** (`bundle.txt`, optional): on your PC, not in the container, run
 `./tools/provider-server.sh`. Put the printed LAN URL for

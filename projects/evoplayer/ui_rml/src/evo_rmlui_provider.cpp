@@ -1217,6 +1217,19 @@ void EvoRmlProviderHost::ApplyPendingActivation()
              hit->title.c_str());
 
     if (hit->is_folder) {
+        /*
+         * A folder row that points at the level already open is a refresh,
+         * not a push: re-ask the provider for this level in place. It is how a
+         * provider offers "check again" (Nuvio's device login polls when the
+         * user presses X on its code) without every press nesting one level
+         * deeper and needing as many Backs to leave.
+         */
+        if (!m_stack.empty() && m_stack.back() == hit->id.c_str()) {
+            m_page = 0;
+            std::string same = m_stack.back();
+            RequestPage(same.c_str(), 0);
+            return;
+        }
         m_stack.push_back(std::string(hit->id.c_str()));
         m_crumbs.push_back(std::string(hit->title.c_str()));
         m_page = 0;

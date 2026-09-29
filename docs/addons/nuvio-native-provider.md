@@ -8,7 +8,7 @@ progress synced to a Nuvio account.
 This is the roadmap's **Stremio / Nuvio v3** story, together with its
 **Torbox** and **Real-Debrid** resolver stories.
 
-**Status:** all three phases are implemented and host-verified (21 tests,
+**Status:** all three phases are implemented and host-verified (23 tests,
 including end-to-end runs against fake servers, clean under ASan and UBSan).
 None of it has run on a console yet. Branch `feat/nuvio-native-provider`.
 Setup and the first-run checklist are in [nuvio-setup.md](nuvio-setup.md).
@@ -83,6 +83,7 @@ Each one is generic. A different provider could have needed any of them.
 | `\uXXXX` escapes decoded to UTF-8 | `cJSON.c` | they came through as literal `uXXXX` |
 | resolver chain skips catalog/web providers | `evo_provider_mgr.c` | a connected Emby accepted a Nuvio magnet as its own id and reported it playable |
 | optional `play_title`, `resume_sec`, `source_prompt` | `evo_provider.h` | OSD title for stream rows, resume from progress, a keyboard prompt that is not "playlist URL". No API bump: NULL means the old behaviour |
+| activating a row that points at the current level refreshes it | `evo_rmlui_provider.cpp` | "check again" rows (device login) without each press nesting a level |
 | resolvers go straight to their key prompt from the chooser | `ProviderHostScreen.cpp` | opening a catalog-less provider landed on an empty host |
 | OPTIONS / chooser Square open the keyboard for a provider with a `source_prompt` | `ProviderHostScreen.cpp` | the setup page is IPTV's, the fallback skin has no button on it, and opening it calls `set_source("")` |
 | SDK v0.42 → v0.43 | `Dockerfile`, compose, scripts | v0.43 is the first SDK with the 13.60 kernel offset table |
@@ -121,10 +122,33 @@ what NuvioTV itself supports for other servers:
   (`version: 1`, `service: nuvio`);
 - or `backend_url=` and `publishable_key=` given directly.
 
-Sign-in is email and password (`/auth/v1/token?grant_type=password`), read
-once from `account.conf`. After the first success the password is removed from
-the file and a refresh token replaces it. A request that comes back 401
-refreshes once and retries (NuvioTV's `withJwtRefreshRetry`).
+**Device login** is how the official server signs TVs in (its NuvioTV
+configuration has password sign-in off). It is NuvioTV's QR login with the
+code shown as text:
+
+1. `rpc/start_device_login_session` with a 24-byte base64url nonce, the
+   approval page (`https://nuvio.tv/link`, `<backend>/link` with `server=`, or
+   `link_page=`), `p_device_type: tv` and `p_device_name`. A server without
+   that function (PostgREST "Could not find the function") gets
+   `rpc/start_tv_login_session` with the `/tv-login` page, and again without
+   `p_device_name` if it lacks that parameter;
+2. the user enters `user_code` on the page from a phone;
+3. `rpc/poll_tv_login_session` reports `pending`, `approved`, `expired`, `used`
+   or `cancelled`;
+4. `functions/v1/tv-logins-exchange` with the code and nonce returns the tokens.
+
+The provider has no timer, so the root shows a **Link your Nuvio account**
+row. The `login` level runs one step each time it is opened, and every row on
+it points back at `login`. The host treats activating a row that points at the
+current level as a refresh (`evo_rmlui_provider.cpp`), so X is "check again"
+without nesting.
+
+**Password sign-in** (`/auth/v1/token?grant_type=password`) remains for servers
+that allow it. The password is read once from `account.conf`, then replaced by
+the refresh token.
+
+Either way, a request that comes back 401 refreshes once and retries (NuvioTV's
+`withJwtRefreshRetry`).
 
 On the first root listing each session:
 
@@ -135,9 +159,9 @@ On the first root listing each session:
 4. `rpc/sync_push_watch_progress` with the local changes, in NuvioTV's shape,
    including `p_origin_client_id` (`evo-ps5-…`, generated once).
 
-Progress is also pushed when playback stops. TV QR login is not implemented:
-it needs a QR encoder and an image path into the provider UI, and email plus
-password covers the same need.
+Progress is also pushed when playback stops. A scannable QR image is not
+implemented: provider UIs can only show http(s) images, so it would need a QR
+encoder plus a new host hook for in-memory images.
 
 ## 7. UI bundle
 
@@ -164,7 +188,7 @@ with `tools/provider-server.sh` and put the printed URL (ending
 | no per-stream request headers in `PlaybackSource` | streams with `behaviorHints.proxyHeaders` are listed last, marked "may not play" |
 | no external subtitle URLs | addon `subtitles[]` ignored; embedded subtitles work |
 | one list per level (API v1) | no horizontal home rails |
-| no TV QR login | account needs email and password once |
+| no scannable QR image | the device-login code is shown as text and typed on the phone |
 | uncached torrents | fail at once with the debrid service's answer; nothing downloads and waits |
 | player limits | per `codec-support.md`: no TrueHD, no bitstream, 4K only on the hardware decoder |
 
